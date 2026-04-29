@@ -10,6 +10,7 @@ import math
 import os
 import sys
 
+import bmesh
 import bpy
 
 # ---------- args ----------
@@ -40,9 +41,9 @@ bpy.ops.wm.read_factory_settings(use_empty=True)
 
 # ---------- enable Export Paper Model addon ----------
 ADDON_CANDIDATES = [
-    "io_export_paper_model",
     "bl_ext.blender_org.export_paper_model",
     "bl_ext.user_default.export_paper_model",
+    "io_export_paper_model",
 ]
 
 addon_loaded = False
@@ -96,6 +97,88 @@ max_dim = max(dims.x, dims.y, dims.z) or 1.0
 scale = TARGET_HEIGHT_M / max_dim
 obj.scale = (scale, scale, scale)
 bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+
+# ---------- clean degenerate geometry ----------
+# AI meshes plus decimation often leave zero-length edges, zero-area
+# faces, and duplicate vertices. The paper-model exporter is strict
+# about these so we hammer the mesh with several passes.
+
+def _bmesh_purge(target_obj, area_eps=1e-7, len_eps=1e-5):
+    """Explicit bmesh pass that deletes any face below ``area_eps`` and
+    collapses any edge below ``len_eps``. More reliable than the bpy.ops
+    'dissolve_degenerate' which can leave slivers."""
+    bm = bmesh.new()
+    bm.from_mesh(target_obj.data)
+
+    bad_faces = [f for f in bm.faces if f.calc_area() < area_eps]
+    if bad_faces:
+        bmesh.ops.delete(bm, geom=bad_faces, context="FACES")
+        bm.faces.ensure_lookup_table()
+
+    bad_edges = [e for e in bm.edges if e.calc_length() < len_eps]
+    if bad_edges:
+        bmesh.ops.collapse(bm, edges=bad_edges, uvs=False)
+        bm.edges.ensure_lookup_table()
+
+    loose_verts = [v for v in bm.verts if not v.link_faces]
+    if loose_verts:
+        bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
+
+    bm.to_mesh(target_obj.data)
+    target_obj.data.update()
+    bm.free()
+    return len(bad_faces), len(bad_edges), len(loose_verts)
+
+
+# Run cleanup with progressively larger thresholds until nothing changes.
+for pass_idx, (merge_dist, area_eps, len_eps) in enumerate(
+    [(0.0005, 1e-7, 1e-5), (0.001, 1e-6, 1e-4), (0.002, 1e-5, 5e-4)]
+):
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    try:
+        bpy.ops.mesh.remove_doubles(threshold=merge_dist)
+    except Exception as e:
+        print(f"[unfold] remove_doubles warn pass {pass_idx}: {e}")
+    try:
+        bpy.ops.mesh.dissolve_degenerate(threshold=merge_dist)
+    except Exception as e:
+        print(f"[unfold] dissolve_degenerate warn pass {pass_idx}: {e}")
+    try:
+        bpy.ops.mesh.delete_loose()
+    except Exception as e:
+        print(f"[unfold] delete_loose warn pass {pass_idx}: {e}")
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # Heavy hammer: explicit per-face / per-edge area & length check.
+    nf, ne, nv = _bmesh_purge(obj, area_eps=area_eps, len_eps=len_eps)
+    print(
+        f"[unfold] cleanup pass {pass_idx}: removed faces={nf} collapsed edges={ne} loose verts={nv}"
+    )
+    if nf == 0 and ne == 0 and nv == 0 and pass_idx >= 1:
+        break
+
+# Final normals fix
+bpy.ops.object.mode_set(mode="EDIT")
+bpy.ops.mesh.select_all(action="SELECT")
+try:
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+except Exception as e:
+    print(f"[unfold] normals warn: {e}")
+bpy.ops.object.mode_set(mode="OBJECT")
+
+# If we ended up with too few faces to be useful, abort with a clear msg.
+if len(obj.data.polygons) < 6:
+    print(
+        f"[unfold] ERROR: cleanup left only {len(obj.data.polygons)} faces. "
+        "The input mesh was too noisy. Try a different image, or raise TARGET_FACES."
+    )
+    sys.exit(6)
+
+print(
+    f"[unfold] cleaned mesh: verts={len(obj.data.vertices)} faces={len(obj.data.polygons)}"
+)
 
 
 # ---------- mark seams along sharp edges so the unfolder has cuts ----------
