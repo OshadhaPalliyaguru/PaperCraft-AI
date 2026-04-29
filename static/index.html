@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Papercraft AI — Image to printable template</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">P</span>
+        <span class="brand-text">Papercraft AI</span>
+      </div>
+      <nav class="links">
+        <a href="https://huggingface.co" target="_blank" rel="noreferrer">Powered by open models</a>
+      </nav>
+    </header>
+
+    <main class="container">
+      <section class="hero">
+        <h1>Turn any image into a printable papercraft template.</h1>
+        <p class="sub">
+          Drop a character, a portrait, anything. We'll generate a low-poly 3D
+          version and unfold it into a print-ready PDF with cut and fold lines.
+        </p>
+      </section>
+
+      <section class="workspace" id="workspace">
+        <div class="dropzone" id="dropzone" tabindex="0">
+          <input type="file" id="file" accept="image/png,image/jpeg,image/webp" hidden />
+          <div class="dz-inner" id="dzInner">
+            <div class="dz-icon">↑</div>
+            <div class="dz-title">Drop an image here</div>
+            <div class="dz-sub">or click to choose · PNG / JPG / WebP</div>
+          </div>
+          <img id="preview" class="preview" alt="" />
+        </div>
+
+        <div class="panel" id="panel">
+          <div class="status" id="status">
+            <div class="status-text" id="statusText">Idle</div>
+            <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+          </div>
+          <div class="actions">
+            <button id="generateBtn" class="primary" disabled>Generate template</button>
+            <button id="resetBtn" class="ghost" disabled>Reset</button>
+          </div>
+          <div class="downloads" id="downloads" hidden>
+            <a id="dlPdf" class="dl primary" href="#" download>Download PDF template</a>
+            <a id="dlGlb" class="dl ghost" href="#" download>Download 3D model (.glb)</a>
+          </div>
+          <div class="error" id="errorBox" hidden></div>
+        </div>
+      </section>
+
+      <section class="tips">
+        <h3>Tips for best results</h3>
+        <ul>
+          <li>Use a clear front-facing image with a single subject.</li>
+          <li>Solid or removable backgrounds work best.</li>
+          <li>Stylised / cartoon / anime images often beat photos.</li>
+          <li>Lower face counts (40–80) are easier to assemble.</li>
+        </ul>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
