@@ -138,6 +138,7 @@ async function pollJob(jobId) {
         generateBtn.disabled = false;
       } else if (job.status === "failed") {
         clearInterval(pollTimer);
+        hideDownloads();
         showError(job.error || "Pipeline failed");
         setStatus("Failed", 100);
         generateBtn.disabled = false;
