@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     )
 
     BLENDER_PATH: str = ""
-    HF_SPACE_ID: str = "stabilityai/TripoSR"
+    HF_SPACE_ID: str = "tencent/Hunyuan3D-2"
     HF_TOKEN: str = ""
     TARGET_FACES: int = 80
     PAGE_SIZE: str = "A4"
