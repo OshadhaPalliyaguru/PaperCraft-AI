@@ -63,12 +63,29 @@ def decimate(input_mesh_path: Path, output_obj_path: Path) -> Path:
     mesh.merge_vertices()
 
     if len(mesh.faces) > target:
+        simplified = None
+        # Try modern API (needs fast-simplification or open3d)
         try:
             simplified = mesh.simplify_quadric_decimation(face_count=target)
+        except (ImportError, ModuleNotFoundError, TypeError) as e:
+            log.warning("Quadric decimation unavailable (%s); using vertex clustering fallback", e)
         except Exception as e:
-            log.warning("Quadric decimation failed (%s); using cluster decimation", e)
-            simplified = mesh.simplify_quadric_decimation(target)
-        mesh = simplified if isinstance(simplified, trimesh.Trimesh) else mesh
+            log.warning("Quadric decimation failed (%s); falling back", e)
+
+        # Fallback: trimesh's built-in vertex clustering. No external deps.
+        if simplified is None or not isinstance(simplified, trimesh.Trimesh):
+            extents = float(max(mesh.extents)) if mesh.extents.size else 1.0
+            target_ratio = max(0.02, min(0.5, (target / max(1, len(mesh.faces))) ** 0.5))
+            pitch = extents * target_ratio
+            try:
+                simplified = mesh.simplify_vertex_clustering(pitch=pitch)
+            except Exception as e:
+                log.warning("Vertex clustering also failed (%s); keeping original mesh", e)
+                simplified = mesh
+
+        if isinstance(simplified, trimesh.Trimesh) and len(simplified.faces) > 0:
+            mesh = simplified
+        log.info("After simplify: %d faces (target=%d)", len(mesh.faces), target)
 
     mesh = _normalize(mesh)
     mesh.process(validate=True)
