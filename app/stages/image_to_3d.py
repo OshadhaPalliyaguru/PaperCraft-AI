@@ -1,16 +1,17 @@
 """Stage 1: Image -> 3D mesh via a free Hugging Face Space.
 
-We use ``gradio_client`` to call public Spaces. APIs differ per Space,
-so we keep a small registry of adapters. To add support for a new
-Space, write an adapter function and register it.
+Adapters were verified against the live Space APIs via ``probe_spaces.py``.
+If a Space changes its API again, re-run::
 
-If a Space is overloaded / changes its API / requires login, swap to
-another preset by editing ``HF_SPACE_ID`` in ``.env``.
+    .\\.venv\\Scripts\\python.exe probe_spaces.py
+
+and update the adapter to match the printed signature.
 """
 from __future__ import annotations
 
 import logging
 import shutil
+import traceback
 from pathlib import Path
 from typing import Callable
 
@@ -25,66 +26,93 @@ log = logging.getLogger(__name__)
 Adapter = Callable[[Client, Path], Path]
 
 
-def _adapt_triposr(client: Client, image_path: Path) -> Path:
-    """Adapter for stabilityai/TripoSR."""
-    # TripoSR pipeline: preprocess -> generate
-    try:
-        prepped = client.predict(
-            handle_file(str(image_path)),
-            True,  # do_remove_background
-            0.85,  # foreground_ratio
-            api_name="/preprocess",
-        )
-    except Exception:
-        prepped = image_path
-    result = client.predict(
-        handle_file(str(prepped)) if isinstance(prepped, str) else prepped,
-        256,  # mc_resolution
-        ["obj", "glb"],
-        api_name="/generate",
-    )
-    return _first_mesh_path(result)
+def _adapt_hunyuan3d_2(client: Client, image_path: Path) -> Path:
+    """Adapter for ``tencent/Hunyuan3D-2``.
 
-
-def _adapt_hunyuan3d(client: Client, image_path: Path) -> Path:
-    """Adapter for tencent/Hunyuan3D-2 family Spaces."""
+    Endpoint ``/shape_generation`` returns ``(file, output, mesh_stats, seed)``
+    where ``file`` is a GLB. We use shape-only (no texture) for speed.
+    """
     result = client.predict(
-        handle_file(str(image_path)),
-        api_name="/generate_shape_only",
+        None,                          # caption
+        handle_file(str(image_path)),  # image
+        None, None, None, None,        # multi-view images (front/back/left/right)
+        30,                            # steps
+        5.0,                           # guidance_scale
+        1234,                          # seed
+        256,                           # octree_resolution
+        True,                          # check_box_rembg (background removal)
+        8000,                          # num_chunks
+        True,                          # randomize_seed
+        api_name="/shape_generation",
     )
     return _first_mesh_path(result)
 
 
 def _adapt_trellis(client: Client, image_path: Path) -> Path:
-    """Adapter for JeffreyXiang/TRELLIS."""
-    result = client.predict(
+    """Adapter for ``JeffreyXiang/TRELLIS``.
+
+    TRELLIS is stateful and needs a 3-step flow:
+      1. ``/start_session`` (server-side state)
+      2. ``/preprocess_image`` -> cleaned image
+      3. ``/image_to_3d``      -> generates internal Gaussian, returns a preview video
+      4. ``/extract_glb``      -> finally produces the GLB file
+    """
+    try:
+        client.predict(api_name="/start_session")
+    except Exception as e:
+        log.debug("TRELLIS start_session non-fatal error: %s", e)
+
+    prepped = client.predict(
         handle_file(str(image_path)),
-        "Random",  # seed
+        api_name="/preprocess_image",
+    )
+    image_arg = handle_file(prepped) if isinstance(prepped, str) else handle_file(str(image_path))
+
+    client.predict(
+        image_arg,
+        [],          # multiimages
+        0,           # seed
+        7.5,         # ss_guidance_strength
+        12,          # ss_sampling_steps
+        3.0,         # slat_guidance_strength
+        12,          # slat_sampling_steps
+        "stochastic",
         api_name="/image_to_3d",
     )
-    return _first_mesh_path(result)
+
+    glb_result = client.predict(
+        0.95,   # mesh_simplify
+        1024,   # texture_size
+        api_name="/extract_glb",
+    )
+    return _first_mesh_path(glb_result)
 
 
 def _adapt_generic(client: Client, image_path: Path) -> Path:
-    """Last-ditch: try the first endpoint and grab anything mesh-like."""
-    endpoints = client.view_api(return_format="dict") or {}
-    log.info("Generic adapter inspected endpoints: %s", list(endpoints))
-    api_name = next(iter(endpoints), None) or "/predict"
+    """Last-ditch: scan endpoints for one that takes an image and returns a file."""
+    api = client.view_api(return_format="dict") or {}
+    log.info("Generic adapter inspected endpoints: %s", list(api))
+    candidates = []
+    for name, info in api.items():
+        params = (info or {}).get("parameters") or []
+        for p in params:
+            if isinstance(p, dict) and (p.get("python_type", {}) or {}).get("type") in {"filepath", "str"}:
+                candidates.append(name)
+                break
+    api_name = candidates[0] if candidates else next(iter(api), "/predict")
     result = client.predict(handle_file(str(image_path)), api_name=api_name)
     return _first_mesh_path(result)
 
 
 ADAPTERS: dict[str, Adapter] = {
-    "stabilityai/TripoSR": _adapt_triposr,
-    "tencent/Hunyuan3D-2": _adapt_hunyuan3d,
-    "tencent/Hunyuan3D-2mini": _adapt_hunyuan3d,
+    "tencent/Hunyuan3D-2": _adapt_hunyuan3d_2,
     "JeffreyXiang/TRELLIS": _adapt_trellis,
 }
 
-# Tried in order if the configured Space fails.
+# Tried in order if the configured Space fails. We only list Spaces that
+# the probe confirmed are currently up and have a working adapter.
 FALLBACK_ORDER = [
-    "stabilityai/TripoSR",
-    "tencent/Hunyuan3D-2mini",
+    "tencent/Hunyuan3D-2",
     "JeffreyXiang/TRELLIS",
 ]
 
@@ -147,12 +175,17 @@ def generate_mesh(
             log.info("Got mesh from %s -> %s", space_id, dest)
             return dest
         except Exception as e:
-            log.warning("Space %s failed: %s", space_id, e)
+            log.warning(
+                "Space %s failed: %s\n%s",
+                space_id,
+                e,
+                traceback.format_exc(),
+            )
             last_err = e
             continue
 
     raise RuntimeError(
         "All image-to-3D Spaces failed. Tried: "
         + ", ".join(tried)
-        + f". Last error: {last_err}"
+        + f". Last error ({type(last_err).__name__}): {last_err}"
     )
