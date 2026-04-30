@@ -25,9 +25,18 @@ class Settings(BaseSettings):
 
     BLENDER_PATH: str = ""
     HF_SPACE_ID: str = "tencent/Hunyuan3D-2"
+    # Comma-separated list of HF tokens. We rotate through them on quota
+    # errors so 3 free accounts ~= 15 min of ZeroGPU minutes per day.
     HF_TOKEN: str = ""
-    TARGET_FACES: int = 80
+    TARGET_FACES: int = 35
     PAGE_SIZE: str = "A4"
+    # If true, generate textured (colored) GLB. ~3x more GPU minutes per call.
+    # Leave false on the free tier so you get more generations per day.
+    WITH_TEXTURE: bool = False
+
+    def hf_tokens(self) -> list[str]:
+        """Parse HF_TOKEN into a clean list (supports comma-separated list)."""
+        return [t.strip() for t in (self.HF_TOKEN or "").split(",") if t.strip()]
 
 
 settings = Settings()
