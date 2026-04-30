@@ -29,9 +29,19 @@ Adapter = Callable[[Client, Path], Path]
 def _adapt_hunyuan3d_2(client: Client, image_path: Path) -> Path:
     """Adapter for ``tencent/Hunyuan3D-2``.
 
-    Endpoint ``/shape_generation`` returns ``(file, output, mesh_stats, seed)``
-    where ``file`` is a GLB. We use shape-only (no texture) for speed.
+    Two endpoints are available:
+      * ``/shape_generation`` — geometry only, ~30 GPU seconds. CHEAP.
+      * ``/generation_all``   — geometry + textures, ~90 GPU seconds. PRETTY but uses 3x your daily ZeroGPU quota.
+
+    Picks based on ``settings.WITH_TEXTURE``.
     """
+    if settings.WITH_TEXTURE:
+        api_name = "/generation_all"
+    else:
+        api_name = "/shape_generation"
+
+    log.info("Hunyuan3D endpoint: %s (WITH_TEXTURE=%s)", api_name, settings.WITH_TEXTURE)
+
     result = client.predict(
         None,                          # caption
         handle_file(str(image_path)),  # image
@@ -40,11 +50,27 @@ def _adapt_hunyuan3d_2(client: Client, image_path: Path) -> Path:
         5.0,                           # guidance_scale
         1234,                          # seed
         256,                           # octree_resolution
-        True,                          # check_box_rembg (background removal)
+        True,                          # check_box_rembg
         8000,                          # num_chunks
         True,                          # randomize_seed
-        api_name="/shape_generation",
+        api_name=api_name,
     )
+
+    # The /generation_all returns (shape_glb, textured_glb, ...). We want the textured one when present.
+    if isinstance(result, (list, tuple)):
+        mesh_paths: list[Path] = []
+        mesh_exts = (".glb", ".obj", ".ply", ".gltf")
+        for x in result:
+            if isinstance(x, str) and x.lower().endswith(mesh_exts) and Path(x).exists():
+                mesh_paths.append(Path(x))
+        if mesh_paths:
+            chosen = mesh_paths[-1] if len(mesh_paths) > 1 else mesh_paths[0]
+            if len(mesh_paths) > 1 and chosen.stat().st_size < mesh_paths[0].stat().st_size * 0.5:
+                chosen = mesh_paths[0]
+            log.info("Hunyuan3D returned %d files; chose %s (%d bytes)",
+                     len(mesh_paths), chosen.name, chosen.stat().st_size)
+            return chosen
+
     return _first_mesh_path(result)
 
 
@@ -142,6 +168,22 @@ def _first_mesh_path(result) -> Path:
     raise RuntimeError(f"No mesh file in Space output: {candidates}")
 
 
+def _is_quota_error(e: Exception) -> bool:
+    """True if the exception looks like an HF ZeroGPU quota / rate-limit error."""
+    msg = str(e).lower()
+    return any(
+        kw in msg
+        for kw in (
+            "zerogpu quota",
+            "running out of",
+            "rate limit",
+            "too many requests",
+            "exceeded your free",
+            "subscribe/pro",
+        )
+    )
+
+
 def generate_mesh(
     image_path: Path,
     job_id: str,
@@ -149,43 +191,67 @@ def generate_mesh(
 ) -> Path:
     """Run image -> 3D and return the path to a GLB/OBJ in the job's tmp dir.
 
-    Tries the configured Space first, then falls back through ``FALLBACK_ORDER``.
+    Tries every (token, space) pair until one succeeds. Tokens are
+    rotated on quota errors so multiple free HF accounts stack their
+    daily ZeroGPU minutes.
     """
     job_tmp = TMP_DIR / job_id
     job_tmp.mkdir(parents=True, exist_ok=True)
 
     primary = settings.HF_SPACE_ID
-    tried = []
+    space_order = [primary] + [s for s in FALLBACK_ORDER if s != primary]
+    tokens = settings.hf_tokens() or [None]  # at least one None = anonymous
+
+    tried: list[str] = []
     last_err: Exception | None = None
 
-    space_order = [primary] + [s for s in FALLBACK_ORDER if s != primary]
+    for token_idx, token in enumerate(tokens):
+        token_label = f"token#{token_idx + 1}" if token else "anonymous"
+        for space_id in space_order:
+            tried.append(f"{space_id} ({token_label})")
+            if on_status:
+                on_status(f"Calling {space_id} via {token_label}...")
+            log.info("Trying Space %s with %s", space_id, token_label)
+            try:
+                kwargs = {"hf_token": token} if token else {}
+                client = Client(space_id, **kwargs)
+                adapter = ADAPTERS.get(space_id, _adapt_generic)
+                result_path = adapter(client, image_path)
+                dest = job_tmp / f"mesh{result_path.suffix.lower()}"
+                shutil.copy2(result_path, dest)
+                log.info("Got mesh from %s (%s) -> %s", space_id, token_label, dest)
+                return dest
+            except Exception as e:
+                log.warning(
+                    "Space %s via %s failed: %s",
+                    space_id,
+                    token_label,
+                    e,
+                )
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug("Trace: %s", traceback.format_exc())
+                last_err = e
+                # If THIS Space says quota exhausted, rotate to the next
+                # token immediately rather than trying more Spaces with
+                # the same token (they share the per-user pool).
+                if _is_quota_error(e):
+                    log.info("Quota error detected; rotating to next token if available.")
+                    break
+                continue
 
-    for space_id in space_order:
-        tried.append(space_id)
-        if on_status:
-            on_status(f"Calling Hugging Face Space: {space_id}")
-        log.info("Trying Space %s", space_id)
-        try:
-            kwargs = {"hf_token": settings.HF_TOKEN} if settings.HF_TOKEN else {}
-            client = Client(space_id, **kwargs)
-            adapter = ADAPTERS.get(space_id, _adapt_generic)
-            result_path = adapter(client, image_path)
-            dest = job_tmp / f"mesh{result_path.suffix.lower()}"
-            shutil.copy2(result_path, dest)
-            log.info("Got mesh from %s -> %s", space_id, dest)
-            return dest
-        except Exception as e:
-            log.warning(
-                "Space %s failed: %s\n%s",
-                space_id,
-                e,
-                traceback.format_exc(),
-            )
-            last_err = e
-            continue
+    hint = ""
+    if last_err and _is_quota_error(last_err):
+        hint = (
+            "\n\nYour Hugging Face daily ZeroGPU quota is exhausted. Options:\n"
+            "  - Set WITH_TEXTURE=False in .env (uses ~3x less GPU per call).\n"
+            "  - Add more free HF accounts: HF_TOKEN=hf_xxx,hf_yyy,hf_zzz in .env.\n"
+            "  - HF Pro ($9/mo) for 25 min/day.\n"
+            "  - Self-host on free Google Colab T4 GPU (effectively unlimited)."
+        )
 
     raise RuntimeError(
-        "All image-to-3D Spaces failed. Tried: "
+        "All image-to-3D attempts failed. Tried: "
         + ", ".join(tried)
         + f". Last error ({type(last_err).__name__}): {last_err}"
+        + hint
     )
