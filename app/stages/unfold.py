@@ -1,4 +1,9 @@
-"""Stage 3: low-poly OBJ -> printable papercraft template via Blender headless."""
+"""Stage 3: 3D mesh -> printable papercraft template via Blender headless.
+
+Accepts either a GLB (preserves textures and UVs through to the PDF) or an
+OBJ (geometry-only). Decimation, cleanup and unfolding all happen inside
+Blender so UVs and materials survive.
+"""
 from __future__ import annotations
 
 import logging
@@ -13,12 +18,6 @@ log = logging.getLogger(__name__)
 
 
 def _resolve_blender() -> str:
-    """Find the Blender executable, in this order:
-
-    1. ``BLENDER_PATH`` env var / .env
-    2. ``blender`` on PATH
-    3. Common Windows install paths
-    """
     if settings.BLENDER_PATH and Path(settings.BLENDER_PATH).exists():
         return settings.BLENDER_PATH
 
@@ -33,6 +32,7 @@ def _resolve_blender() -> str:
         r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
         r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
         r"C:\Program Files\Blender Foundation\Blender 3.6\blender.exe",
+        r"D:\Blender\blender.exe",
         "/Applications/Blender.app/Contents/MacOS/Blender",
         "/usr/bin/blender",
         "/usr/local/bin/blender",
@@ -43,13 +43,13 @@ def _resolve_blender() -> str:
 
     raise RuntimeError(
         "Could not locate Blender. Set BLENDER_PATH in .env to the full "
-        "path of blender.exe (e.g. "
-        r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe)"
+        "path of blender.exe (NOT blender-launcher.exe)."
     )
 
 
-def unfold(obj_path: Path, output_pdf: Path) -> Path:
-    """Run Blender in headless mode to unfold ``obj_path`` to ``output_pdf``."""
+def unfold(input_mesh: Path, output_pdf: Path) -> Path:
+    """Run Blender in headless mode to unfold ``input_mesh`` (.glb or .obj)
+    into ``output_pdf``."""
     blender = _resolve_blender()
     script = BLENDER_SCRIPTS_DIR / "unfold.py"
 
@@ -61,9 +61,10 @@ def unfold(obj_path: Path, output_pdf: Path) -> Path:
         "--factory-startup",
         "--python", str(script),
         "--",
-        str(obj_path),
+        str(input_mesh),
         str(output_pdf),
         settings.PAGE_SIZE,
+        str(settings.TARGET_FACES),
     ]
 
     log.info("Running Blender: %s", " ".join(cmd))
@@ -71,7 +72,7 @@ def unfold(obj_path: Path, output_pdf: Path) -> Path:
         cmd,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=600,
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
     if proc.stdout:
